@@ -1,0 +1,17 @@
+{
+  "name": "glownest-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:admin-schema": "mysql -u root -p < database/admin-schema.sql",
+    "db:schema": "mysql -u root -p < database/schema.sql",
+    "db:seed": "node src/seed.js",
+    "dev": "node src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "mysql2": "^3.23.2"
+  }
+}
