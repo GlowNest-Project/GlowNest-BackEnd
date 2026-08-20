@@ -78,6 +78,11 @@ CREATE TABLE IF NOT EXISTS products (
   koko_pay_text VARCHAR(120) NULL,
   short_description TEXT NULL,
   detail_description TEXT NULL,
+  key_ingredients TEXT NULL,
+  main_benefits TEXT NULL,
+  skin_type VARCHAR(255) NULL,
+  skin_concerns TEXT NULL,
+  how_to_use TEXT NULL,
   image_url VARCHAR(255) NULL,
   detail_image_url VARCHAR(255) NULL,
   stock_quantity INT UNSIGNED NOT NULL DEFAULT 0,
@@ -294,6 +299,23 @@ CREATE TABLE IF NOT EXISTS customer_notifications (
     FOREIGN KEY (order_id) REFERENCES orders(id)
     ON UPDATE CASCADE
     ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS admin_notifications (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id BIGINT UNSIGNED NULL,
+  notification_type VARCHAR(60) NOT NULL DEFAULT 'new_order',
+  title VARCHAR(120) NOT NULL,
+  message VARCHAR(255) NOT NULL,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY admin_notifications_order_id_index (order_id),
+  KEY admin_notifications_is_read_index (is_read),
+  CONSTRAINT admin_notifications_order_id_foreign
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+    ON UPDATE CASCADE
+    ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS customer_addresses (

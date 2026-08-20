@@ -374,10 +374,13 @@ const NOTE_LABELS = {
 };
 
 function mapProductRow(row) {
+  const isCosmetic = row.category_slug === "cosmetics";
   const discountType = row.discount_type === "fixed_amount" ? "fixed_amount" : "percentage";
-  const discountTarget = ["full", "decant", "both"].includes(row.discount_target)
-    ? row.discount_target
-    : "both";
+  const discountTarget = isCosmetic
+    ? "full"
+    : ["full", "decant", "both"].includes(row.discount_target)
+      ? row.discount_target
+      : "both";
   const discountPercent = Number(row.discount_percent || 0);
   const discountAmount = Number(row.discount_amount_lkr || 0);
   const discountValue = discountType === "fixed_amount" ? discountAmount : discountPercent;
@@ -414,6 +417,11 @@ function mapProductRow(row) {
     concentration: row.concentration,
     gender: row.gender,
     volume: row.volume,
+    keyIngredients: row.key_ingredients,
+    mainBenefits: row.main_benefits,
+    skinType: row.skin_type,
+    skinConcerns: row.skin_concerns,
+    howToUse: row.how_to_use,
     shape: row.shape_hint,
     priceValue: applyDiscount(fullBottlePrice, "full"),
     originalPriceValue: fullBottlePrice,
@@ -426,7 +434,7 @@ function mapProductRow(row) {
     discountEnabled,
     isDiscountActive,
     decant:
-      row.decant_price_lkr != null
+      !isCosmetic && row.decant_price_lkr != null
         ? {
             size: row.decant_size,
             priceValue: applyDiscount(decantPrice, "decant"),
@@ -481,13 +489,16 @@ async function uniqueProductSlug(name, existingId) {
 
 async function productInput(body, existingId = null) {
   const categorySlug = String(body.category || "").trim();
+  const isCosmetic = categorySlug === "cosmetics";
   const name = String(body.name || "").trim();
   const priceValue = Number(body.priceValue);
-  const decantPriceValue = body.decantPriceValue ? Number(body.decantPriceValue) : null;
+  const decantPriceValue = !isCosmetic && body.decantPriceValue ? Number(body.decantPriceValue) : null;
   const discountType = body.discountType === "fixed_amount" ? "fixed_amount" : "percentage";
-  const discountTarget = ["full", "decant", "both"].includes(body.discountTarget)
-    ? body.discountTarget
-    : "both";
+  const discountTarget = isCosmetic
+    ? "full"
+    : ["full", "decant", "both"].includes(body.discountTarget)
+      ? body.discountTarget
+      : "both";
   const discountPercent = Number(body.discountPercent || 0);
   const discountAmount = Number(body.discountAmount || 0);
   const requestedDiscountValue = discountType === "fixed_amount" ? discountAmount : discountPercent;
@@ -496,8 +507,8 @@ async function productInput(body, existingId = null) {
   const discountStartDate = String(body.discountStartAt || "").trim().slice(0, 10) || null;
   const discountEndDate = String(body.discountEndAt || "").trim().slice(0, 10) || null;
 
-  if (!["perfumes", "cosmetics", "skincare"].includes(categorySlug)) {
-    return { error: "Choose perfumes, cosmetics, or skincare." };
+  if (!["perfumes", "cosmetics"].includes(categorySlug)) {
+    return { error: "Choose perfumes or cosmetics." };
   }
 
   if (name.length < 2) {
@@ -505,7 +516,7 @@ async function productInput(body, existingId = null) {
   }
 
   if (!Number.isFinite(priceValue) || priceValue <= 0) {
-    return { error: "Valid full bottle price is required." };
+    return { error: isCosmetic ? "Valid price is required." : "Valid full bottle price is required." };
   }
 
   if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent >= 100) {
@@ -568,21 +579,26 @@ async function productInput(body, existingId = null) {
     slug: await uniqueProductSlug(name, existingId),
     brand: String(body.brand || "").trim() || null,
     type: String(body.type || (categorySlug === "perfumes" ? "Perfume" : "Cosmetic")).trim(),
-    concentration: String(body.concentration || "").trim() || null,
+    concentration: isCosmetic ? null : String(body.concentration || "").trim() || null,
     gender: String(body.gender || "").trim() || null,
     volume: String(body.volume || "").trim() || null,
-    fragranceFamily: String(body.fragranceFamily || "").trim() || null,
-    releaseYear: String(body.releaseYear || "").trim() || null,
-    perfumers: String(body.perfumers || "").trim() || null,
+    fragranceFamily: isCosmetic ? null : String(body.fragranceFamily || "").trim() || null,
+    releaseYear: isCosmetic ? null : String(body.releaseYear || "").trim() || null,
+    perfumers: isCosmetic ? null : String(body.perfumers || "").trim() || null,
+    keyIngredients: isCosmetic ? String(body.keyIngredients || "").trim() || null : null,
+    mainBenefits: isCosmetic ? String(body.mainBenefits || "").trim() || null : null,
+    skinType: isCosmetic ? String(body.skinType || "").trim() || null : null,
+    skinConcerns: isCosmetic ? String(body.skinConcerns || "").trim() || null : null,
+    howToUse: isCosmetic ? String(body.howToUse || "").trim() || null : null,
     priceValue,
     discountType: discountValue > 0 ? discountType : "percentage",
-    discountTarget: discountValue > 0 ? discountTarget : "both",
+    discountTarget: discountValue > 0 ? discountTarget : isCosmetic ? "full" : "both",
     discountPercent: discountType === "percentage" ? discountPercent : 0,
     discountAmount: discountType === "fixed_amount" ? discountAmount : 0,
     discountStartAt: discountValue > 0 ? `${discountStartDate} 00:00:00` : null,
     discountEndAt: discountValue > 0 ? `${formatLocalDate(exclusiveEndDate)} 00:00:00` : null,
     decantPriceValue,
-    decantSize: String(body.decantSize || "10mL").trim() || "10mL",
+    decantSize: isCosmetic ? null : String(body.decantSize || "10mL").trim() || "10mL",
     kokoPay: String(body.kokoPay || "").trim() || null,
     shortDescription: String(body.shortDescription || "").trim() || null,
     detailDescription: String(body.detailDescription || "").trim() || null,
@@ -591,11 +607,11 @@ async function productInput(body, existingId = null) {
     popImage: String(body.popImage || "").trim() || null,
     stockQuantity: body.stockStatus === "out_of_stock" ? 0 : Math.max(1, Number(body.stockQuantity || 1)),
     isActive: body.isActive !== false,
-    topNotes: splitList(body.topNotes),
-    heartNotes: splitList(body.heartNotes),
-    baseNotes: splitList(body.baseNotes),
-    accords: splitList(body.accords),
-    bestFor: splitList(body.bestFor),
+    topNotes: isCosmetic ? [] : splitList(body.topNotes),
+    heartNotes: isCosmetic ? [] : splitList(body.heartNotes),
+    baseNotes: isCosmetic ? [] : splitList(body.baseNotes),
+    accords: isCosmetic ? [] : splitList(body.accords),
+    bestFor: isCosmetic ? [] : splitList(body.bestFor),
   };
 }
 
@@ -672,7 +688,7 @@ async function getAdminProductList() {
   const rows = await query(
     `SELECT p.*, c.slug AS category_slug FROM products p
      JOIN categories c ON c.id = p.category_id
-     WHERE c.slug IN ('perfumes', 'cosmetics', 'skincare')
+     WHERE c.slug IN ('perfumes', 'cosmetics')
      ORDER BY p.updated_at DESC, p.id DESC`
   );
 
@@ -884,6 +900,25 @@ async function ensureOrderNotificationTables() {
         ON DELETE CASCADE
     )
   `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS admin_notifications (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      order_id BIGINT UNSIGNED NULL,
+      notification_type VARCHAR(60) NOT NULL DEFAULT 'new_order',
+      title VARCHAR(120) NOT NULL,
+      message VARCHAR(255) NOT NULL,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY admin_notifications_order_id_index (order_id),
+      KEY admin_notifications_is_read_index (is_read),
+      CONSTRAINT admin_notifications_order_id_foreign
+        FOREIGN KEY (order_id) REFERENCES orders(id)
+        ON UPDATE CASCADE
+        ON DELETE SET NULL
+    )
+  `);
 }
 
 async function ensureScheduledDiscountColumns() {
@@ -914,6 +949,24 @@ async function ensureScheduledDiscountColumns() {
 
   if (!orderColumnNames.has("discount_lkr")) {
     await query("ALTER TABLE orders ADD COLUMN discount_lkr DECIMAL(10, 2) NOT NULL DEFAULT 0 AFTER subtotal_lkr");
+  }
+}
+
+async function ensureCosmeticProductColumns() {
+  const columns = await query("SHOW COLUMNS FROM products");
+  const columnNames = new Set(columns.map((column) => column.Field));
+  const cosmeticColumns = [
+    ["key_ingredients", "TEXT NULL"],
+    ["main_benefits", "TEXT NULL"],
+    ["skin_type", "VARCHAR(255) NULL"],
+    ["skin_concerns", "TEXT NULL"],
+    ["how_to_use", "TEXT NULL"],
+  ];
+
+  for (const [columnName, definition] of cosmeticColumns) {
+    if (!columnNames.has(columnName)) {
+      await query(`ALTER TABLE products ADD COLUMN ${columnName} ${definition} AFTER detail_description`);
+    }
   }
 }
 
@@ -952,6 +1005,45 @@ function mapCustomerNotification(row) {
     isRead: Boolean(row.is_read),
     createdAt: row.created_at,
   };
+}
+
+function mapAdminNotification(row) {
+  return {
+    id: row.id,
+    orderId: row.order_id,
+    orderNumber: row.order_number,
+    type: row.notification_type,
+    title: row.title,
+    message: row.message,
+    isRead: Boolean(row.is_read),
+    createdAt: row.created_at,
+  };
+}
+
+async function getAdminNotifications() {
+  const rows = await query(
+    `SELECT an.*, o.order_number
+     FROM admin_notifications an
+     LEFT JOIN orders o ON o.id = an.order_id
+     ORDER BY an.created_at DESC, an.id DESC
+     LIMIT 100`
+  );
+
+  return rows.map(mapAdminNotification);
+}
+
+async function addAdminOrderNotification(order, discount) {
+  const discountMessage = discount > 0 ? ` Discount saved: LKR ${discount.toFixed(2)}.` : "";
+
+  await query(
+    `INSERT INTO admin_notifications (order_id, notification_type, title, message)
+     VALUES (:orderId, 'new_order', :title, :message)`,
+    {
+      orderId: order.id,
+      title: `New order ${order.order_number}`,
+      message: `${order.customer_name} placed an order for LKR ${Number(order.total_lkr).toFixed(2)}.${discountMessage}`,
+    }
+  );
 }
 
 async function addOrderStatusHistory(orderId, status, note = null) {
@@ -1117,6 +1209,24 @@ function activeScheduledPrice(product, basePrice, option) {
     : Math.round((Number(basePrice || 0) * (100 - percentage)) / 100);
 }
 
+const PERFUME_FULL_BOTTLE_WEIGHT_GRAMS = 600;
+const BASE_DELIVERY_FEE_LKR = 500;
+const EXTRA_KILOGRAM_FEE_LKR = 100;
+
+function calculateDelivery(resolvedItems) {
+  const perfumeWeightGrams = resolvedItems.reduce((total, item) => {
+    const isFullPerfume = item.category === "perfumes" && item.option !== "decant";
+    return total + (isFullPerfume ? PERFUME_FULL_BOTTLE_WEIGHT_GRAMS * item.quantity : 0);
+  }, 0);
+  const billableKilograms = Math.max(1, Math.ceil(perfumeWeightGrams / 1000));
+
+  return {
+    perfumeWeightGrams,
+    billableKilograms,
+    deliveryFee: BASE_DELIVERY_FEE_LKR + (billableKilograms - 1) * EXTRA_KILOGRAM_FEE_LKR,
+  };
+}
+
 async function resolveOrderItems(items) {
   const resolvedItems = [];
 
@@ -1139,7 +1249,8 @@ async function resolveOrderItems(items) {
       return { error: `Only ${product.stock_quantity} of ${product.name} are currently available.` };
     }
 
-    const isDecant = item.option === "decant" && product.decant_price_lkr != null;
+    const isCosmetic = product.category_slug === "cosmetics";
+    const isDecant = !isCosmetic && item.option === "decant" && product.decant_price_lkr != null;
     const basePrice = Number(isDecant ? product.decant_price_lkr : product.price_lkr);
     const discountedPrice = activeScheduledPrice(product, basePrice, isDecant ? "decant" : "full");
     const optionLabel = isDecant ? `${product.decant_size || "10mL"} decant` : "Full bottle";
@@ -1148,7 +1259,7 @@ async function resolveOrderItems(items) {
       id: product.slug,
       productId: product.id,
       productSlug: product.slug,
-      name: `${product.name} - ${optionLabel}`,
+      name: isCosmetic ? product.name : `${product.name} - ${optionLabel}`,
       quantity,
       priceValue: basePrice,
       originalPriceValue: basePrice,
@@ -1157,6 +1268,7 @@ async function resolveOrderItems(items) {
       lineTotal: basePrice * quantity,
       discountedLineTotal: discountedPrice * quantity,
       type: product.product_type,
+      category: product.category_slug,
       option: isDecant ? "decant" : "full",
     });
   }
@@ -1482,17 +1594,6 @@ async function handleRequest(request, response) {
       }
 
       await ensureAdminTable();
-      const [adminCount] = await adminQuery("SELECT COUNT(*) AS total FROM admin_users");
-
-      if (Number(adminCount.total) > 0) {
-        const currentAdmin = await getCurrentAdmin(request);
-
-        if (!currentAdmin) {
-          sendJson(response, 403, { error: "Admin registration is closed. Sign in with an existing admin account." });
-          return;
-        }
-      }
-
       const [existingAdmin] = await adminQuery("SELECT id FROM admin_users WHERE email = :email", {
         email,
       });
@@ -1584,6 +1685,36 @@ async function handleRequest(request, response) {
       }
 
       sendJson(response, 200, { orders: await getAdminOrderList() });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/admin/notifications") {
+      const admin = await requireAdmin(request, response);
+
+      if (!admin) return;
+
+      sendJson(response, 200, { notifications: await getAdminNotifications() });
+      return;
+    }
+
+    if (method === "PUT" && url.pathname === "/api/admin/notifications/read") {
+      const admin = await requireAdmin(request, response);
+
+      if (!admin) return;
+
+      await query("UPDATE admin_notifications SET is_read = TRUE WHERE is_read = FALSE");
+      sendJson(response, 200, { notifications: await getAdminNotifications() });
+      return;
+    }
+
+    if (method === "DELETE" && url.pathname.startsWith("/api/admin/notifications/")) {
+      const admin = await requireAdmin(request, response);
+
+      if (!admin) return;
+
+      const notificationId = url.pathname.split("/").filter(Boolean)[3];
+      await query("DELETE FROM admin_notifications WHERE id = :id", { id: notificationId });
+      sendJson(response, 200, { notifications: await getAdminNotifications() });
       return;
     }
 
@@ -1720,12 +1851,14 @@ async function handleRequest(request, response) {
           fragrance_family, release_year, perfumers, price_lkr, decant_price_lkr,
           discount_type, discount_target, discount_percent, discount_amount_lkr, discount_start_at, discount_end_at,
           decant_size, koko_pay_text, short_description, detail_description,
+          key_ingredients, main_benefits, skin_type, skin_concerns, how_to_use,
           image_url, detail_image_url, stock_quantity, is_active
         ) VALUES (
           :categoryId, :name, :slug, :brand, :type, :concentration, :gender, :volume,
           :fragranceFamily, :releaseYear, :perfumers, :priceValue, :decantPriceValue,
           :discountType, :discountTarget, :discountPercent, :discountAmount, :discountStartAt, :discountEndAt,
           :decantSize, :kokoPay, :shortDescription, :detailDescription,
+          :keyIngredients, :mainBenefits, :skinType, :skinConcerns, :howToUse,
           :image, :detailImage, :stockQuantity, :isActive
         )`,
         input
@@ -1796,6 +1929,8 @@ async function handleRequest(request, response) {
              discount_end_at = :discountEndAt,
              decant_size = :decantSize, koko_pay_text = :kokoPay,
              short_description = :shortDescription, detail_description = :detailDescription,
+             key_ingredients = :keyIngredients, main_benefits = :mainBenefits,
+             skin_type = :skinType, skin_concerns = :skinConcerns, how_to_use = :howToUse,
              image_url = :image, detail_image_url = :detailImage,
              stock_quantity = :stockQuantity, is_active = :isActive
          WHERE id = :id`,
@@ -1870,7 +2005,6 @@ async function handleRequest(request, response) {
       const customer = body.customer || {};
       const paymentMethod = body.paymentMethod === "card" ? "card" : "cash_on_delivery";
       const paymentStatus = paymentMethod === "card" ? "pending" : "pending";
-      const deliveryFee = 500;
 
       if (items.length === 0) {
         sendJson(response, 400, { error: "Order needs at least one item." });
@@ -1898,6 +2032,8 @@ async function handleRequest(request, response) {
       }
 
       const resolvedItems = resolvedOrder.items;
+      const delivery = calculateDelivery(resolvedItems);
+      const deliveryFee = delivery.deliveryFee;
       const subtotal = resolvedItems.reduce((sum, item) => sum + item.lineTotal, 0);
       const discount = resolvedItems.reduce((sum, item) => sum + item.discountAmount, 0);
       const total = subtotal - discount + deliveryFee;
@@ -1956,10 +2092,13 @@ async function handleRequest(request, response) {
       }
 
       const [order] = await query("SELECT * FROM orders WHERE id = :id", { id: orderId });
+      await addAdminOrderNotification(order, discount);
       sendJson(response, 201, {
         order: {
           ...order,
           items: resolvedItems,
+          deliveryWeightGrams: delivery.perfumeWeightGrams,
+          billableKilograms: delivery.billableKilograms,
           paymentGateway:
             paymentMethod === "card"
               ? createPayHereCheckout({
@@ -2049,7 +2188,11 @@ async function handleRequest(request, response) {
   }
 }
 
-Promise.all([ensureOrderNotificationTables(), ensureScheduledDiscountColumns()])
+Promise.all([
+  ensureOrderNotificationTables(),
+  ensureScheduledDiscountColumns(),
+  ensureCosmeticProductColumns(),
+])
   .then(async () => {
     await clearExpiredDiscounts();
     const discountCleanupTimer = setInterval(() => {
