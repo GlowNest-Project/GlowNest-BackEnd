@@ -5,6 +5,8 @@ import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { adminQuery, ensureAdminDatabase } from "./admin-db.js";
 import { query } from "./db.js";
+import { sendEmailVerificationOtp } from "./mailer.js";
+import { sendPhoneVerificationOtp } from "./sms.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const AUTH_SECRET = process.env.AUTH_SECRET || "glownest-local-secret";
@@ -23,6 +25,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PRODUCT_UPLOAD_DIR = join(__dirname, "..", "..", "FrontEnd", "public", "uploads", "products");
 const PRODUCT_UPLOAD_URL = "/uploads/products";
 const signupOtpSessions = new Map();
+const accountOtpSessions = new Map();
+
+function cleanupAccountOtpSessions() {
+  const now = Date.now();
+  for (const [key, session] of accountOtpSessions.entries()) {
+    if (session.expiresAt < now) {
+      accountOtpSessions.delete(key);
+    }
+  }
+}
 
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
@@ -202,7 +214,7 @@ function createSignupOtpSession(userInput) {
     expiresAt,
   });
 
-  return { verificationId, emailOtp, phoneOtp, expiresAt };
+  return { verificationId, emailOtp, phoneOtp, expiresAt, userInput };
 }
 
 function cleanupSignupOtpSessions() {
@@ -215,10 +227,30 @@ function cleanupSignupOtpSessions() {
   }
 }
 
-async function sendSignupOtp({ email, phone, emailOtp, phoneOtp }) {
-  // Connect Gmail SMTP and SMS gateway here for production.
-  console.log(`[GlowNest OTP] Email ${email}: ${emailOtp}`);
-  console.log(`[GlowNest OTP] Phone ${phone}: ${phoneOtp}`);
+async function sendSignupOtp({ email, phone, emailOtp, phoneOtp, name }) {
+  try {
+    await sendEmailVerificationOtp({
+      to: email,
+      otpCode: emailOtp,
+      name: name || "Customer",
+    });
+  } catch (error) {
+    console.error(`[GlowNest Mailer Error] Failed to send email OTP to ${email}:`, error?.message || error);
+  }
+
+  try {
+    await sendPhoneVerificationOtp({
+      phone,
+      otpCode: phoneOtp,
+    });
+  } catch (error) {
+    console.error(`[GlowNest SMS Error] Failed to send phone OTP to ${phone}:`, error?.message || error);
+  }
+
+  if (OTP_DEV_MODE) {
+    console.log(`[GlowNest OTP - Dev Log] Email ${email}: ${emailOtp}`);
+    console.log(`[GlowNest OTP - Dev Log] Phone ${phone}: ${phoneOtp}`);
+  }
 }
 
 function createToken(userId) {
@@ -256,12 +288,19 @@ function readToken(request) {
 }
 
 function publicUser(user) {
+  const isEmailVerified = Boolean(user.is_email_verified || user.email_verified_at);
+  const isPhoneVerified = Boolean(user.is_phone_verified || user.phone_verified_at);
   return {
     id: user.id,
     name: user.full_name,
     phone: user.phone,
     email: user.email,
     role: user.role,
+    isEmailVerified,
+    isPhoneVerified,
+    isVerified: isEmailVerified && isPhoneVerified,
+    emailVerifiedAt: user.email_verified_at || null,
+    phoneVerifiedAt: user.phone_verified_at || null,
     createdAt: user.created_at,
   };
 }
@@ -970,6 +1009,27 @@ async function ensureCosmeticProductColumns() {
   }
 }
 
+async function ensureUserVerificationColumns() {
+  try {
+    const columns = await query("SHOW COLUMNS FROM users");
+    const columnNames = new Set(columns.map((column) => column.Field));
+    const verificationColumns = [
+      ["is_email_verified", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["is_phone_verified", "BOOLEAN NOT NULL DEFAULT FALSE"],
+      ["email_verified_at", "TIMESTAMP NULL"],
+      ["phone_verified_at", "TIMESTAMP NULL"],
+    ];
+
+    for (const [columnName, definition] of verificationColumns) {
+      if (!columnNames.has(columnName)) {
+        await query(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`);
+      }
+    }
+  } catch (error) {
+    console.warn(`[GlowNest DB] User verification columns check note: ${error.message}`);
+  }
+}
+
 async function clearExpiredDiscounts() {
   await query(
     `UPDATE products
@@ -1378,9 +1438,37 @@ async function handleRequest(request, response) {
     }
 
     if (method === "POST" && url.pathname === "/api/auth/signup") {
-      sendJson(response, 400, {
-        error: "Please verify email and phone OTP before creating an account.",
-      });
+      const body = await readBody(request);
+      const validationError = validateSignup(body);
+
+      if (validationError) {
+        sendJson(response, 400, { error: validationError });
+        return;
+      }
+
+      const email = body.email.trim().toLowerCase();
+      const phone = normalizePhone(body.phone);
+      const [existingUser] = await query("SELECT id FROM users WHERE email = :email", { email });
+
+      if (existingUser) {
+        sendJson(response, 409, { error: "This email already has an account. Please log in instead." });
+        return;
+      }
+
+      const result = await query(
+        `INSERT INTO users (full_name, phone, email, password_hash, is_email_verified, is_phone_verified)
+         VALUES (:name, :phone, :email, :passwordHash, FALSE, FALSE)`,
+        {
+          name: body.name.trim(),
+          phone,
+          email,
+          passwordHash: hashPassword(body.password),
+        }
+      );
+
+      const [user] = await query("SELECT * FROM users WHERE id = :id", { id: result.insertId });
+
+      sendJson(response, 201, { user: publicUser(user), token: createToken(user.id) });
       return;
     }
 
@@ -1416,6 +1504,7 @@ async function handleRequest(request, response) {
         phone,
         emailOtp: otpSession.emailOtp,
         phoneOtp: otpSession.phoneOtp,
+        name: body.name?.trim() || "Customer",
       });
 
       sendJson(response, 200, {
@@ -1473,8 +1562,8 @@ async function handleRequest(request, response) {
       }
 
       const result = await query(
-        `INSERT INTO users (full_name, phone, email, password_hash)
-         VALUES (:name, :phone, :email, :passwordHash)`,
+        `INSERT INTO users (full_name, phone, email, password_hash, is_email_verified, is_phone_verified)
+         VALUES (:name, :phone, :email, :passwordHash, TRUE, TRUE)`,
         {
           name: session.userInput.name,
           phone: session.userInput.phone,
@@ -1488,6 +1577,230 @@ async function handleRequest(request, response) {
       const [user] = await query("SELECT * FROM users WHERE id = :id", { id: result.insertId });
 
       sendJson(response, 201, { user: publicUser(user), token: createToken(user.id) });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/auth/verify-email/request-otp") {
+      cleanupAccountOtpSessions();
+      const user = await getCurrentUser(request);
+
+      if (!user) {
+        sendJson(response, 401, { error: "Please log in first." });
+        return;
+      }
+
+      if (user.is_email_verified) {
+        sendJson(response, 400, { error: "Your email is already verified." });
+        return;
+      }
+
+      const emailOtp = createOtpCode();
+      const sessionKey = `email_${user.id}`;
+      accountOtpSessions.set(sessionKey, {
+        userId: user.id,
+        type: "email",
+        target: user.email,
+        otpHash: hashOtp(emailOtp),
+        attempts: 0,
+        expiresAt: Date.now() + OTP_EXPIRY_MS,
+      });
+
+      try {
+        await sendEmailVerificationOtp({
+          to: user.email,
+          otpCode: emailOtp,
+          name: user.full_name || "Customer",
+        });
+      } catch (err) {
+        console.error("[Mailer Error]", err);
+      }
+
+      if (OTP_DEV_MODE) {
+        console.log(`[Email OTP Dev Log] User ${user.id} (${user.email}): ${emailOtp}`);
+      }
+
+      sendJson(response, 200, {
+        message: `Verification code sent to ${user.email}.`,
+        expiresInMinutes: Math.round(OTP_EXPIRY_MS / 60_000),
+        ...(OTP_DEV_MODE ? { devOtp: emailOtp } : {}),
+      });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/auth/verify-email/confirm") {
+      cleanupAccountOtpSessions();
+      const user = await getCurrentUser(request);
+
+      if (!user) {
+        sendJson(response, 401, { error: "Please log in first." });
+        return;
+      }
+
+      const body = await readBody(request);
+      const otp = String(body.otp || "").trim();
+      const sessionKey = `email_${user.id}`;
+      const session = accountOtpSessions.get(sessionKey);
+
+      if (!session || session.expiresAt < Date.now()) {
+        accountOtpSessions.delete(sessionKey);
+        sendJson(response, 400, { error: "Verification code expired. Please request a new code." });
+        return;
+      }
+
+      if (session.attempts >= 5) {
+        accountOtpSessions.delete(sessionKey);
+        sendJson(response, 429, { error: "Too many wrong attempts. Please request a new code." });
+        return;
+      }
+
+      if (!/^\d{6}$/.test(otp) || !safeOtpMatch(otp, session.otpHash)) {
+        session.attempts += 1;
+        sendJson(response, 400, { error: "Invalid verification code. Please check and try again." });
+        return;
+      }
+
+      accountOtpSessions.delete(sessionKey);
+
+      await query(
+        `UPDATE users 
+         SET is_email_verified = TRUE, email_verified_at = CURRENT_TIMESTAMP 
+         WHERE id = :id`,
+        { id: user.id }
+      );
+
+      const [updatedUser] = await query("SELECT * FROM users WHERE id = :id", { id: user.id });
+
+      sendJson(response, 200, {
+        message: "Email verified successfully!",
+        user: publicUser(updatedUser),
+      });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/auth/verify-phone/request-otp") {
+      cleanupAccountOtpSessions();
+      const user = await getCurrentUser(request);
+
+      if (!user) {
+        sendJson(response, 401, { error: "Please log in first." });
+        return;
+      }
+
+      if (user.is_phone_verified) {
+        sendJson(response, 400, { error: "Your phone number is already verified." });
+        return;
+      }
+
+      const phoneOtp = createOtpCode();
+      const sessionKey = `phone_${user.id}`;
+      accountOtpSessions.set(sessionKey, {
+        userId: user.id,
+        type: "phone",
+        target: user.phone,
+        otpHash: hashOtp(phoneOtp),
+        attempts: 0,
+        expiresAt: Date.now() + OTP_EXPIRY_MS,
+      });
+
+      try {
+        await sendPhoneVerificationOtp({
+          phone: user.phone,
+          otpCode: phoneOtp,
+        });
+      } catch (err) {
+        console.error("[SMS Error]", err);
+      }
+
+      if (OTP_DEV_MODE) {
+        console.log(`[Phone OTP Dev Log] User ${user.id} (${user.phone}): ${phoneOtp}`);
+      }
+
+      sendJson(response, 200, {
+        message: `Verification code sent to ${user.phone}.`,
+        expiresInMinutes: Math.round(OTP_EXPIRY_MS / 60_000),
+        ...(OTP_DEV_MODE ? { devOtp: phoneOtp } : {}),
+      });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/auth/verify-phone/confirm") {
+      cleanupAccountOtpSessions();
+      const user = await getCurrentUser(request);
+
+      if (!user) {
+        sendJson(response, 401, { error: "Please log in first." });
+        return;
+      }
+
+      const body = await readBody(request);
+      const otp = String(body.otp || "").trim();
+      const sessionKey = `phone_${user.id}`;
+      const session = accountOtpSessions.get(sessionKey);
+
+      if (!session || session.expiresAt < Date.now()) {
+        accountOtpSessions.delete(sessionKey);
+        sendJson(response, 400, { error: "Verification code expired. Please request a new code." });
+        return;
+      }
+
+      if (session.attempts >= 5) {
+        accountOtpSessions.delete(sessionKey);
+        sendJson(response, 429, { error: "Too many wrong attempts. Please request a new code." });
+        return;
+      }
+
+      if (!/^\d{6}$/.test(otp) || !safeOtpMatch(otp, session.otpHash)) {
+        session.attempts += 1;
+        sendJson(response, 400, { error: "Invalid verification code. Please check and try again." });
+        return;
+      }
+
+      accountOtpSessions.delete(sessionKey);
+
+      await query(
+        `UPDATE users 
+         SET is_phone_verified = TRUE, phone_verified_at = CURRENT_TIMESTAMP 
+         WHERE id = :id`,
+        { id: user.id }
+      );
+
+      const [updatedUser] = await query("SELECT * FROM users WHERE id = :id", { id: user.id });
+
+      sendJson(response, 200, {
+        message: "Phone number verified successfully!",
+        user: publicUser(updatedUser),
+      });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/auth/change-password") {
+      const user = await getCurrentUser(request);
+
+      if (!user) {
+        sendJson(response, 401, { error: "Please log in first." });
+        return;
+      }
+
+      const body = await readBody(request);
+      const currentPassword = String(body.currentPassword || "");
+      const newPassword = String(body.newPassword || "");
+
+      if (!verifyPassword(currentPassword, user.password_hash)) {
+        sendJson(response, 400, { error: "Current password is incorrect." });
+        return;
+      }
+
+      if (newPassword.length < 8) {
+        sendJson(response, 400, { error: "New password must be at least 8 characters long." });
+        return;
+      }
+
+      await query(
+        "UPDATE users SET password_hash = :passwordHash WHERE id = :id",
+        { id: user.id, passwordHash: hashPassword(newPassword) }
+      );
+
+      sendJson(response, 200, { message: "Password updated successfully!" });
       return;
     }
 
@@ -1537,6 +1850,7 @@ async function handleRequest(request, response) {
       }
 
       const email = body.email.trim().toLowerCase();
+      const phone = normalizePhone(body.phone);
       const [existingUser] = await query(
         "SELECT id FROM users WHERE email = :email AND id <> :id",
         { email, id: user.id }
@@ -1547,15 +1861,26 @@ async function handleRequest(request, response) {
         return;
       }
 
+      const emailChanged = email !== user.email;
+      const phoneChanged = phone !== user.phone;
+
       await query(
         `UPDATE users
-         SET full_name = :name, phone = :phone, email = :email
+         SET full_name = :name,
+             phone = :phone,
+             email = :email,
+             is_email_verified = CASE WHEN :emailChanged = 1 THEN FALSE ELSE is_email_verified END,
+             email_verified_at = CASE WHEN :emailChanged = 1 THEN NULL ELSE email_verified_at END,
+             is_phone_verified = CASE WHEN :phoneChanged = 1 THEN FALSE ELSE is_phone_verified END,
+             phone_verified_at = CASE WHEN :phoneChanged = 1 THEN NULL ELSE phone_verified_at END
          WHERE id = :id`,
         {
           id: user.id,
           name: body.name.trim(),
-          phone: body.phone.trim(),
+          phone,
           email,
+          emailChanged: emailChanged ? 1 : 0,
+          phoneChanged: phoneChanged ? 1 : 0,
         }
       );
 
@@ -2192,6 +2517,7 @@ Promise.all([
   ensureOrderNotificationTables(),
   ensureScheduledDiscountColumns(),
   ensureCosmeticProductColumns(),
+  ensureUserVerificationColumns(),
 ])
   .then(async () => {
     await clearExpiredDiscounts();
