@@ -11,8 +11,11 @@
     "start": "node src/server.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
     "dotenv": "^17.4.2",
     "mysql2": "^3.23.2",
-    "nodemailer": "^9.0.5"
+    "nodemailer": "^9.0.5",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4"
   }
 }

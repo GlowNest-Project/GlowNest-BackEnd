@@ -6,3 +6,5 @@ node_modules/
 .env.*.local
 data/db.json
 npm-debug.log*
+.whatsapp_auth/
+

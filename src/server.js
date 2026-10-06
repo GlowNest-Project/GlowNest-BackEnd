@@ -7,6 +7,8 @@ import { adminQuery, ensureAdminDatabase } from "./admin-db.js";
 import { query } from "./db.js";
 import { sendEmailVerificationOtp } from "./mailer.js";
 import { sendPhoneVerificationOtp } from "./sms.js";
+import { sendWhatsAppVerificationOtp } from "./whatsappOtp.js";
+import { initWhatsAppBot, getWhatsAppBotStatus, disconnectWhatsAppBot } from "./whatsappBot.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const AUTH_SECRET = process.env.AUTH_SECRET || "glownest-local-secret";
@@ -24,6 +26,8 @@ const OTP_EXPIRY_MS = Number(process.env.OTP_EXPIRY_MINUTES || 10) * 60 * 1000;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PRODUCT_UPLOAD_DIR = join(__dirname, "..", "..", "FrontEnd", "public", "uploads", "products");
 const PRODUCT_UPLOAD_URL = "/uploads/products";
+const REVIEW_UPLOAD_DIR = join(__dirname, "..", "..", "FrontEnd", "public", "uploads", "reviews");
+const REVIEW_UPLOAD_URL = "/uploads/reviews";
 const signupOtpSessions = new Map();
 const accountOtpSessions = new Map();
 
@@ -103,8 +107,8 @@ function readRawBody(request) {
       chunks.push(chunk);
       size += chunk.length;
 
-      if (size > 8_000_000) {
-        reject(new Error("Image is too large. Please upload an image under 8MB."));
+      if (size > 10_500_000) {
+        reject(new Error("Image is too large. Please upload an image under 10MB."));
       }
     });
 
@@ -170,6 +174,26 @@ async function saveUploadedProductImage(upload) {
   await writeFile(join(PRODUCT_UPLOAD_DIR, fileName), upload.buffer);
 
   return `${PRODUCT_UPLOAD_URL}/${fileName}`;
+}
+
+async function saveUploadedReviewImage(upload) {
+  if (!upload.mimeType.startsWith("image/")) {
+    throw new Error("Please upload an image file.");
+  }
+
+  const extension = extname(upload.filename).toLowerCase() || ".jpg";
+  const allowedExtensions = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+
+  if (!allowedExtensions.has(extension)) {
+    throw new Error("Please upload JPG, PNG, or WEBP images only.");
+  }
+
+  await mkdir(REVIEW_UPLOAD_DIR, { recursive: true });
+
+  const fileName = `review-${Date.now()}-${crypto.randomBytes(4).toString("hex")}${extension}`;
+  await writeFile(join(REVIEW_UPLOAD_DIR, fileName), upload.buffer);
+
+  return `${REVIEW_UPLOAD_URL}/${fileName}`;
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -239,17 +263,18 @@ async function sendSignupOtp({ email, phone, emailOtp, phoneOtp, name }) {
   }
 
   try {
-    await sendPhoneVerificationOtp({
+    await sendWhatsAppVerificationOtp({
       phone,
       otpCode: phoneOtp,
+      name,
     });
   } catch (error) {
-    console.error(`[GlowNest SMS Error] Failed to send phone OTP to ${phone}:`, error?.message || error);
+    console.error(`[GlowNest WhatsApp/Phone Error] Failed to send OTP to ${phone}:`, error?.message || error);
   }
 
   if (OTP_DEV_MODE) {
     console.log(`[GlowNest OTP - Dev Log] Email ${email}: ${emailOtp}`);
-    console.log(`[GlowNest OTP - Dev Log] Phone ${phone}: ${phoneOtp}`);
+    console.log(`[GlowNest OTP - Dev Log] WhatsApp/Phone ${phone}: ${phoneOtp}`);
   }
 }
 
@@ -487,6 +512,9 @@ function mapProductRow(row) {
     stockQuantity: Number(row.stock_quantity || 0),
     isInStock: Number(row.stock_quantity || 0) > 0,
     isActive: Boolean(row.is_active),
+    rating: row.rating != null ? Number(row.rating) : null,
+    reviewCount: Number(row.review_count || 0),
+    totalSold: Number(row.total_sold || 0),
   };
 }
 
@@ -762,7 +790,24 @@ async function getProductList(url) {
              FROM product_images pi
              WHERE pi.product_id = p.id AND pi.image_type = 'gallery' AND pi.sort_order = 99
              LIMIT 1
-           ) AS pop_image_url
+           ) AS pop_image_url,
+           (
+             SELECT ROUND(AVG(pr.rating), 1)
+             FROM product_reviews pr
+             WHERE pr.product_id = p.id AND pr.status = 'approved'
+           ) AS rating,
+           (
+             SELECT COUNT(*)
+             FROM product_reviews pr
+             WHERE pr.product_id = p.id AND pr.status = 'approved'
+           ) AS review_count,
+           (
+             SELECT COALESCE(SUM(oi.quantity), 0)
+             FROM order_items oi
+             JOIN orders o ON o.id = oi.order_id
+             WHERE (oi.product_id = p.id OR (oi.product_id IS NULL AND oi.product_slug = p.slug))
+               AND o.order_status != 'cancelled'
+           ) AS total_sold
          FROM products p
          JOIN categories c ON c.id = p.category_id
          WHERE p.is_active = 1 AND c.slug = :category
@@ -776,7 +821,24 @@ async function getProductList(url) {
              FROM product_images pi
              WHERE pi.product_id = p.id AND pi.image_type = 'gallery' AND pi.sort_order = 99
              LIMIT 1
-           ) AS pop_image_url
+           ) AS pop_image_url,
+           (
+             SELECT ROUND(AVG(pr.rating), 1)
+             FROM product_reviews pr
+             WHERE pr.product_id = p.id AND pr.status = 'approved'
+           ) AS rating,
+           (
+             SELECT COUNT(*)
+             FROM product_reviews pr
+             WHERE pr.product_id = p.id AND pr.status = 'approved'
+           ) AS review_count,
+           (
+             SELECT COALESCE(SUM(oi.quantity), 0)
+             FROM order_items oi
+             JOIN orders o ON o.id = oi.order_id
+             WHERE (oi.product_id = p.id OR (oi.product_id IS NULL AND oi.product_slug = p.slug))
+               AND o.order_status != 'cancelled'
+           ) AS total_sold
          FROM products p
          JOIN categories c ON c.id = p.category_id
          WHERE p.is_active = 1
@@ -786,9 +848,73 @@ async function getProductList(url) {
   return rows.map(mapProductRow);
 }
 
+async function getFeaturedProductList() {
+  const fetchTopCategory = (categorySlug, limit) =>
+    query(
+      `SELECT p.*, c.slug AS category_slug,
+         (
+           SELECT pi.image_url
+           FROM product_images pi
+           WHERE pi.product_id = p.id AND pi.image_type = 'gallery' AND pi.sort_order = 99
+           LIMIT 1
+         ) AS pop_image_url,
+         (
+           SELECT ROUND(AVG(pr.rating), 1)
+           FROM product_reviews pr
+           WHERE pr.product_id = p.id AND pr.status = 'approved'
+         ) AS rating,
+         (
+           SELECT COUNT(*)
+           FROM product_reviews pr
+           WHERE pr.product_id = p.id AND pr.status = 'approved'
+         ) AS review_count,
+         (
+           SELECT COALESCE(SUM(oi.quantity), 0)
+           FROM order_items oi
+           JOIN orders o ON o.id = oi.order_id
+           WHERE (oi.product_id = p.id OR (oi.product_id IS NULL AND oi.product_slug = p.slug))
+             AND o.order_status != 'cancelled'
+         ) AS total_sold
+       FROM products p
+       JOIN categories c ON c.id = p.category_id
+       WHERE p.is_active = 1 AND c.slug = :categorySlug AND p.image_url IS NOT NULL
+       ORDER BY total_sold DESC, review_count DESC, rating DESC, p.id ASC
+       LIMIT ${Number(limit)}`,
+      { categorySlug }
+    );
+
+  const [topPerfumes, topCosmetics] = await Promise.all([
+    fetchTopCategory("perfumes", 2),
+    fetchTopCategory("cosmetics", 1),
+  ]);
+
+  return [
+    ...topPerfumes.map(mapProductRow),
+    ...topCosmetics.map(mapProductRow),
+  ];
+}
+
 async function getProductDetail(slug) {
   const [row] = await query(
-    `SELECT p.*, c.slug AS category_slug FROM products p
+    `SELECT p.*, c.slug AS category_slug,
+       (
+         SELECT ROUND(AVG(pr.rating), 1)
+         FROM product_reviews pr
+         WHERE pr.product_id = p.id AND pr.status = 'approved'
+       ) AS rating,
+       (
+         SELECT COUNT(*)
+         FROM product_reviews pr
+         WHERE pr.product_id = p.id AND pr.status = 'approved'
+       ) AS review_count,
+       (
+         SELECT COALESCE(SUM(oi.quantity), 0)
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE (oi.product_id = p.id OR (oi.product_id IS NULL AND oi.product_slug = p.slug))
+           AND o.order_status != 'cancelled'
+       ) AS total_sold
+     FROM products p
      JOIN categories c ON c.id = p.category_id
      WHERE p.slug = :slug OR p.id = :slug
      LIMIT 1`,
@@ -859,6 +985,10 @@ const ORDER_STATUS_DETAILS = {
   packed: {
     title: "Order packed",
     message: "Your order is packed and ready for delivery.",
+  },
+  shipped: {
+    title: "Order out for delivery",
+    message: "Your order has been dispatched with our courier partner and is on the way.",
   },
   delivered: {
     title: "Order delivered",
@@ -958,6 +1088,115 @@ async function ensureOrderNotificationTables() {
         ON DELETE SET NULL
     )
   `);
+}
+
+async function ensureProductReviewTables() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS product_reviews (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      product_id BIGINT UNSIGNED NOT NULL,
+      user_id BIGINT UNSIGNED NULL,
+      customer_name VARCHAR(120) NOT NULL,
+      customer_email VARCHAR(160) NULL,
+      rating TINYINT UNSIGNED NOT NULL,
+      title VARCHAR(180) NULL,
+      comment TEXT NOT NULL,
+      image_url VARCHAR(255) NULL,
+      status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+      is_verified_purchase BOOLEAN NOT NULL DEFAULT FALSE,
+      admin_reply TEXT NULL,
+      admin_replied_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY product_reviews_product_id_index (product_id),
+      KEY product_reviews_user_id_index (user_id),
+      KEY product_reviews_status_index (status),
+      KEY product_reviews_rating_index (rating),
+      CONSTRAINT product_reviews_product_id_foreign
+        FOREIGN KEY (product_id) REFERENCES products(id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+      CONSTRAINT product_reviews_user_id_foreign
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON UPDATE CASCADE
+        ON DELETE SET NULL
+    )
+  `);
+
+  await query("ALTER TABLE product_reviews ALTER COLUMN status SET DEFAULT 'pending'").catch(() => {});
+
+  const columns = await query("SHOW COLUMNS FROM product_reviews");
+  const columnNames = new Set(columns.map((column) => column.Field));
+  if (!columnNames.has("image_url")) {
+    await query("ALTER TABLE product_reviews ADD COLUMN image_url VARCHAR(255) NULL AFTER comment");
+  }
+}
+
+async function ensureOfferTables() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS offers (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      label VARCHAR(80) NOT NULL,
+      title VARCHAR(180) NOT NULL,
+      description TEXT NOT NULL,
+      link_url VARCHAR(255) NULL,
+      badge_text VARCHAR(80) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY offers_is_active_index (is_active),
+      KEY offers_sort_order_index (sort_order)
+    )
+  `);
+}
+
+function mapOfferRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    label: row.label,
+    title: row.title,
+    description: row.description,
+    copy: row.description,
+    linkUrl: row.link_url || "",
+    badgeText: row.badge_text || "",
+    sortOrder: Number(row.sort_order || 0),
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function ensureOrderDeliveryTrackingColumns() {
+  try {
+    // 1. Update order_status ENUM to include 'shipped'
+    await query(`
+      ALTER TABLE orders 
+      MODIFY COLUMN order_status ENUM('new', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled') NOT NULL DEFAULT 'new'
+    `).catch(() => {});
+
+    // 2. Add courier_name if missing
+    const orderCols = await query("SHOW COLUMNS FROM orders");
+    const orderColNames = new Set(orderCols.map((c) => c.Field));
+
+    if (!orderColNames.has("courier_name")) {
+      await query("ALTER TABLE orders ADD COLUMN courier_name VARCHAR(100) NULL AFTER order_status");
+    }
+    if (!orderColNames.has("tracking_number")) {
+      await query("ALTER TABLE orders ADD COLUMN tracking_number VARCHAR(100) NULL AFTER courier_name");
+    }
+    if (!orderColNames.has("tracking_url")) {
+      await query("ALTER TABLE orders ADD COLUMN tracking_url VARCHAR(255) NULL AFTER tracking_number");
+    }
+    if (!orderColNames.has("estimated_delivery_date")) {
+      await query("ALTER TABLE orders ADD COLUMN estimated_delivery_date VARCHAR(60) NULL AFTER tracking_url");
+    }
+  } catch (err) {
+    console.error("ensureOrderDeliveryTrackingColumns migration error:", err.message);
+  }
 }
 
 async function ensureScheduledDiscountColumns() {
@@ -1161,8 +1400,117 @@ async function recordOrderStatusUpdate(order, status, note = null, { notify = tr
   }
 }
 
+function resolveCourierTrackingUrl(url, courierName, trackingNumber) {
+  let cleanUrl = typeof url === "string" ? url.trim() : "";
+  const courier = String(courierName || "").toLowerCase();
+  const tracking = String(trackingNumber || "").trim();
+
+  if (cleanUrl.includes("royalexpress.lk")) {
+    cleanUrl = "https://royalexpress.tracking.curfox.com/";
+  } else if (cleanUrl.includes("koombiyodelivery.net")) {
+    cleanUrl = "https://koombiyodelivery.lk/";
+  } else if (cleanUrl.includes("promptx.lk")) {
+    cleanUrl = "https://promptxpress.lk/TrackItem.aspx";
+  }
+
+  if (!cleanUrl) {
+    if (courier.includes("royal")) {
+      cleanUrl = "https://royalexpress.tracking.curfox.com/";
+    } else if (courier.includes("domex") && tracking) {
+      cleanUrl = `https://www.domex.lk/tracking.php?tracking_no=${encodeURIComponent(tracking)}`;
+    } else if (courier.includes("prompt")) {
+      cleanUrl = "https://promptxpress.lk/TrackItem.aspx";
+    } else if (courier.includes("koombiyo")) {
+      cleanUrl = "https://koombiyodelivery.lk/";
+    } else if (courier.includes("citypak")) {
+      cleanUrl = "https://www.citypak.lk/";
+    }
+  }
+
+  return cleanUrl || "";
+}
+
+const STATUS_RANKS = {
+  new: 0,
+  confirmed: 0,
+  packed: 1,
+  shipped: 2,
+  delivered: 3,
+};
+
+function parseEstimatedDeliveryCutoff(dateStr) {
+  if (!dateStr || typeof dateStr !== "string") return null;
+  const cleaned = dateStr.trim();
+  if (!cleaned) return null;
+
+  let d = new Date(cleaned);
+
+  // If invalid, try extracting DD/MM/YYYY or DD-MM-YYYY
+  if (isNaN(d.getTime())) {
+    const dmyMatch = cleaned.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+    if (dmyMatch) {
+      const day = parseInt(dmyMatch[1], 10);
+      const month = parseInt(dmyMatch[2], 10) - 1;
+      const year = parseInt(dmyMatch[3], 10);
+      d = new Date(year, month, day);
+    }
+  }
+
+  // If still invalid, try matching Day Month Year (e.g. 26 Sep 2026 or 26 Sep)
+  if (isNaN(d.getTime())) {
+    const wordsMatch = cleaned.match(/(\d{1,2})\s+([A-Za-z]+)\s*(\d{4})?/);
+    if (wordsMatch) {
+      const year = wordsMatch[3] ? parseInt(wordsMatch[3], 10) : new Date().getFullYear();
+      d = new Date(`${wordsMatch[1]} ${wordsMatch[2]} ${year}`);
+    }
+  }
+
+  if (isNaN(d.getTime())) return null;
+
+  // Cutoff is 11:00 PM (23:00) on that date in Sri Lanka Time (Asia/Colombo, UTC+5:30)
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return new Date(`${year}-${month}-${day}T23:00:00+05:30`);
+}
+
+async function autoDeliverDueOrders() {
+  try {
+    const shippedOrders = await query(
+      `SELECT * FROM orders 
+       WHERE order_status = 'shipped' 
+         AND estimated_delivery_date IS NOT NULL 
+         AND TRIM(estimated_delivery_date) != ''`
+    );
+
+    const now = Date.now();
+    for (const order of shippedOrders) {
+      const cutoff = parseEstimatedDeliveryCutoff(order.estimated_delivery_date);
+      if (cutoff && now >= cutoff.getTime()) {
+        const result = await query(
+          `UPDATE orders 
+           SET order_status = 'delivered' 
+           WHERE id = :id AND order_status = 'shipped'`,
+          { id: order.id }
+        );
+
+        if (result && result.affectedRows > 0) {
+          await recordOrderStatusUpdate(
+            order,
+            "delivered",
+            `Automatically marked as delivered based on estimated delivery date (${order.estimated_delivery_date})`
+          );
+          console.log(`[Auto-Deliver] Order #${order.order_number} auto-marked as delivered at 11:00 PM cutoff.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Auto-deliver check error:", err);
+  }
+}
+
 async function getOrderDetail(orderId) {
-  const [order] = await query(
+  let [order] = await query(
     `SELECT o.*,
             p.transaction_reference,
             p.paid_at,
@@ -1176,6 +1524,27 @@ async function getOrderDetail(orderId) {
 
   if (!order) {
     return null;
+  }
+
+  // Auto-deliver check for this order if due
+  if (order.order_status === "shipped" && order.estimated_delivery_date) {
+    const cutoff = parseEstimatedDeliveryCutoff(order.estimated_delivery_date);
+    if (cutoff && Date.now() >= cutoff.getTime()) {
+      const [updateResult] = await query(
+        `UPDATE orders 
+         SET order_status = 'delivered' 
+         WHERE id = :id AND order_status = 'shipped'`,
+        { id: order.id }
+      );
+      if (updateResult && updateResult.affectedRows > 0) {
+        await recordOrderStatusUpdate(
+          order,
+          "delivered",
+          `Automatically marked as delivered based on estimated delivery date (${order.estimated_delivery_date})`
+        );
+        order.order_status = "delivered";
+      }
+    }
   }
 
   const [items, statusHistory] = await Promise.all([
@@ -1205,6 +1574,10 @@ async function getOrderDetail(orderId) {
     paymentMethod: order.payment_method,
     paymentStatus: order.payment_status,
     orderStatus: order.order_status,
+    courierName: order.courier_name || "",
+    trackingNumber: order.tracking_number || "",
+    trackingUrl: resolveCourierTrackingUrl(order.tracking_url, order.courier_name, order.tracking_number),
+    estimatedDeliveryDate: order.estimated_delivery_date || "",
     transactionReference: order.transaction_reference,
     paidAt: order.paid_at,
     createdAt: order.created_at,
@@ -1216,6 +1589,7 @@ async function getOrderDetail(orderId) {
 }
 
 async function getAdminOrderList() {
+  await autoDeliverDueOrders();
   const rows = await query("SELECT id FROM orders ORDER BY created_at DESC, id DESC");
   return Promise.all(rows.map((row) => getOrderDetail(row.id)));
 }
@@ -1227,7 +1601,7 @@ function normalizePaymentStatus(status) {
 
 function normalizeOrderStatus(status, fallback = "new") {
   const orderStatus = String(status || "").trim();
-  return ["new", "confirmed", "packed", "delivered", "cancelled"].includes(orderStatus)
+  return ["new", "confirmed", "packed", "shipped", "delivered", "cancelled"].includes(orderStatus)
     ? orderStatus
     : fallback;
 }
@@ -1336,9 +1710,34 @@ async function resolveOrderItems(items) {
   return { items: resolvedItems };
 }
 
-function generateOrderNumber() {
-  const random = crypto.randomBytes(3).toString("hex").toUpperCase();
-  return `GN${Date.now()}${random}`;
+async function generateOrderNumber() {
+  const rows = await query(
+    "SELECT order_number FROM orders WHERE order_number IS NOT NULL AND order_number != '' ORDER BY id DESC"
+  );
+
+  let maxNum = 0;
+  for (const row of rows) {
+    const raw = String(row.order_number || "").trim();
+    const match = raw.match(/(\d+)$/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num < 1_000_000 && num > maxNum) {
+        maxNum = num;
+      }
+    }
+  }
+
+  let nextNum = maxNum + 1;
+  let candidate = `GN-${String(nextNum).padStart(4, "0")}`;
+
+  while (true) {
+    const [existing] = await query("SELECT id FROM orders WHERE order_number = :candidate LIMIT 1", { candidate });
+    if (!existing) {
+      return candidate;
+    }
+    nextNum += 1;
+    candidate = `GN-${String(nextNum).padStart(4, "0")}`;
+  }
 }
 
 function isPayHereConfigured() {
@@ -1421,6 +1820,188 @@ async function handleRequest(request, response) {
 
     if (method === "GET" && url.pathname === "/api/products") {
       sendJson(response, 200, { products: await getProductList(url) });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/featured-products") {
+      sendJson(response, 200, { products: await getFeaturedProductList() });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/offers") {
+      const rows = await query(
+        "SELECT * FROM offers WHERE is_active = 1 ORDER BY sort_order ASC, id ASC"
+      );
+      sendJson(response, 200, { offers: rows.map(mapOfferRow) });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/reviews/upload") {
+      const upload = parseMultipartImage(request, await readRawBody(request));
+      const imageUrl = await saveUploadedReviewImage(upload);
+      sendJson(response, 201, { imageUrl });
+      return;
+    }
+
+    if (method === "GET" && url.pathname.startsWith("/api/products/") && url.pathname.endsWith("/reviews")) {
+      const slug = decodeURIComponent(url.pathname.slice("/api/products/".length, -"/reviews".length));
+      const [product] = await query(
+        "SELECT id, name FROM products WHERE slug = :slug OR id = :slug LIMIT 1",
+        { slug }
+      );
+
+      if (!product) {
+        sendJson(response, 404, { error: "Product not found." });
+        return;
+      }
+
+      const reviews = await query(
+        `SELECT pr.*, u.full_name AS user_name
+         FROM product_reviews pr
+         LEFT JOIN users u ON u.id = pr.user_id
+         WHERE pr.product_id = :productId AND pr.status = 'approved'
+         ORDER BY pr.created_at DESC`,
+        { productId: product.id }
+      );
+
+      const ratingCounts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      let totalRatingSum = 0;
+      for (const r of reviews) {
+        const star = Number(r.rating);
+        if (ratingCounts[star] !== undefined) {
+          ratingCounts[star]++;
+        }
+        totalRatingSum += star;
+      }
+      const totalReviews = reviews.length;
+      const averageRating = totalReviews > 0 ? Number((totalRatingSum / totalReviews).toFixed(1)) : 0;
+
+      sendJson(response, 200, {
+        reviews: reviews.map((r) => ({
+          id: r.id,
+          productId: r.product_id,
+          customerName: r.customer_name,
+          rating: Number(r.rating),
+          title: r.title,
+          comment: r.comment,
+          imageUrl: r.image_url,
+          isVerifiedPurchase: Boolean(r.is_verified_purchase),
+          adminReply: r.admin_reply,
+          adminRepliedAt: r.admin_replied_at,
+          createdAt: r.created_at,
+        })),
+        summary: {
+          averageRating,
+          totalReviews,
+          ratingCounts,
+        },
+      });
+      return;
+    }
+
+    if (method === "POST" && url.pathname.startsWith("/api/products/") && url.pathname.endsWith("/reviews")) {
+      const slug = decodeURIComponent(url.pathname.slice("/api/products/".length, -"/reviews".length));
+      const [product] = await query(
+        "SELECT id, name FROM products WHERE slug = :slug OR id = :slug LIMIT 1",
+        { slug }
+      );
+
+      if (!product) {
+        sendJson(response, 404, { error: "Product not found." });
+        return;
+      }
+
+      const body = await readBody(request);
+      const rating = Math.round(Number(body.rating));
+      const customerName = String(body.customerName || "").trim();
+      const customerEmail = body.customerEmail ? String(body.customerEmail).trim().toLowerCase() : null;
+      const title = body.title ? String(body.title).trim() : null;
+      const comment = String(body.comment || "").trim();
+      const imageUrl = body.imageUrl ? String(body.imageUrl).trim() : null;
+
+      if (!rating || rating < 1 || rating > 5) {
+        sendJson(response, 400, { error: "Please select a star rating between 1 and 5." });
+        return;
+      }
+      if (!customerName || customerName.length < 2) {
+        sendJson(response, 400, { error: "Please provide your name (at least 2 characters)." });
+        return;
+      }
+      if (!comment || comment.length < 5) {
+        sendJson(response, 400, { error: "Please write a review comment (at least 5 characters)." });
+        return;
+      }
+
+      const user = await getCurrentUser(request);
+      let isVerifiedPurchase = false;
+
+      if (user) {
+        const [purchase] = await query(
+          `SELECT oi.id
+           FROM order_items oi
+           JOIN orders o ON o.id = oi.order_id
+           WHERE o.user_id = :userId AND oi.product_id = :productId AND o.order_status != 'cancelled'
+           LIMIT 1`,
+          { userId: user.id, productId: product.id }
+        );
+        if (purchase) {
+          isVerifiedPurchase = true;
+        }
+      }
+
+      const result = await query(
+        `INSERT INTO product_reviews (
+          product_id, user_id, customer_name, customer_email, rating, title, comment, image_url, status, is_verified_purchase
+        ) VALUES (
+          :productId, :userId, :customerName, :customerEmail, :rating, :title, :comment, :imageUrl, 'pending', :isVerifiedPurchase
+        )`,
+        {
+          productId: product.id,
+          userId: user ? user.id : null,
+          customerName: user ? (user.full_name || customerName) : customerName,
+          customerEmail: user ? (user.email || customerEmail) : customerEmail,
+          rating,
+          title: title || null,
+          comment,
+          imageUrl: imageUrl || null,
+          isVerifiedPurchase: isVerifiedPurchase ? 1 : 0,
+        }
+      );
+
+      try {
+        await query(
+          `INSERT INTO admin_notifications (notification_type, title, message)
+           VALUES ('new_review', :title, :message)`,
+          {
+            title: `New review pending approval: ${product.name}`,
+            message: `${customerName} left a ${rating}-star review for ${product.name}. Awaiting admin approval.`,
+          }
+        );
+      } catch (notifyErr) {
+        console.warn("[GlowNest] Could not create admin review notification:", notifyErr.message);
+      }
+
+      const [createdReview] = await query("SELECT * FROM product_reviews WHERE id = :id", {
+        id: result.insertId,
+      });
+
+      sendJson(response, 201, {
+        message: "Thank you! Your review has been submitted and will be published once approved by our team.",
+        review: {
+          id: createdReview.id,
+          productId: createdReview.product_id,
+          customerName: createdReview.customer_name,
+          rating: Number(createdReview.rating),
+          title: createdReview.title,
+          comment: createdReview.comment,
+          imageUrl: createdReview.image_url,
+          status: createdReview.status,
+          isVerifiedPurchase: Boolean(createdReview.is_verified_purchase),
+          adminReply: createdReview.admin_reply,
+          adminRepliedAt: createdReview.admin_replied_at,
+          createdAt: createdReview.created_at,
+        },
+      });
       return;
     }
 
@@ -1605,12 +2186,14 @@ async function handleRequest(request, response) {
         expiresAt: Date.now() + OTP_EXPIRY_MS,
       });
 
+      let emailSent = false;
       try {
-        await sendEmailVerificationOtp({
+        const mailResult = await sendEmailVerificationOtp({
           to: user.email,
           otpCode: emailOtp,
-          name: user.full_name || "Customer",
+          name: user.full_name || user.name || "Customer",
         });
+        emailSent = Boolean(mailResult?.success);
       } catch (err) {
         console.error("[Mailer Error]", err);
       }
@@ -1622,7 +2205,7 @@ async function handleRequest(request, response) {
       sendJson(response, 200, {
         message: `Verification code sent to ${user.email}.`,
         expiresInMinutes: Math.round(OTP_EXPIRY_MS / 60_000),
-        ...(OTP_DEV_MODE ? { devOtp: emailOtp } : {}),
+        ...(!emailSent && OTP_DEV_MODE ? { devOtp: emailOtp } : {}),
       });
       return;
     }
@@ -1702,23 +2285,27 @@ async function handleRequest(request, response) {
         expiresAt: Date.now() + OTP_EXPIRY_MS,
       });
 
+      let deliveryResult = { channel: "whatsapp" };
       try {
-        await sendPhoneVerificationOtp({
+        deliveryResult = await sendWhatsAppVerificationOtp({
           phone: user.phone,
           otpCode: phoneOtp,
+          name: user.name,
         });
       } catch (err) {
-        console.error("[SMS Error]", err);
+        console.error("[WhatsApp/Phone Error]", err);
       }
 
       if (OTP_DEV_MODE) {
-        console.log(`[Phone OTP Dev Log] User ${user.id} (${user.phone}): ${phoneOtp}`);
+        console.log(`[WhatsApp/Phone OTP Dev Log] User ${user.id} (${user.phone}): ${phoneOtp}`);
       }
 
+      const channelName = deliveryResult?.channel === "sms" ? "SMS" : "WhatsApp";
       sendJson(response, 200, {
-        message: `Verification code sent to ${user.phone}.`,
+        message: `Verification code sent to your ${channelName} (${user.phone}).`,
+        channel: deliveryResult?.channel || "whatsapp",
         expiresInMinutes: Math.round(OTP_EXPIRY_MS / 60_000),
-        ...(OTP_DEV_MODE ? { devOtp: phoneOtp } : {}),
+        ...(!deliveryResult?.success && OTP_DEV_MODE ? { devOtp: phoneOtp } : {}),
       });
       return;
     }
@@ -2079,7 +2666,11 @@ async function handleRequest(request, response) {
         const orderStatus =
           body.orderStatus ||
           (paymentStatus === "paid" ? "confirmed" : paymentStatus === "failed" ? "cancelled" : existingOrder.order_status);
-        const nextOrderStatus = normalizeOrderStatus(orderStatus, existingOrder.order_status);
+        let nextOrderStatus = normalizeOrderStatus(orderStatus, existingOrder.order_status);
+        const existingRank = STATUS_RANKS[existingOrder.order_status] ?? 0;
+        if (paymentStatus === "paid" && (STATUS_RANKS[nextOrderStatus] ?? 0) < existingRank) {
+          nextOrderStatus = existingOrder.order_status;
+        }
         const transactionReference = String(body.transactionReference || "").trim() || null;
 
         await query(
@@ -2112,18 +2703,56 @@ async function handleRequest(request, response) {
       if (action === "status") {
         const orderStatus = normalizeOrderStatus(body.orderStatus, existingOrder.order_status);
 
-        if (!["confirmed", "packed", "delivered"].includes(orderStatus)) {
-          sendJson(response, 400, { error: "Choose order received, packed, or order delivered." });
+        if (!["confirmed", "packed", "shipped", "delivered"].includes(orderStatus)) {
+          sendJson(response, 400, { error: "Choose order received, packed, out for delivery, or order delivered." });
           return;
         }
 
-        await query("UPDATE orders SET order_status = :orderStatus WHERE id = :orderId", {
-          orderId,
-          orderStatus,
-        });
+        const currentRank = STATUS_RANKS[existingOrder.order_status] ?? 0;
+        const nextRank = STATUS_RANKS[orderStatus] ?? 0;
 
-        if (orderStatus !== existingOrder.order_status) {
-          await recordOrderStatusUpdate(existingOrder, orderStatus);
+        if (nextRank < currentRank) {
+          sendJson(response, 400, {
+            error: `Cannot revert order status from "${existingOrder.order_status}" back to "${orderStatus}". Order steps can only move forward.`,
+          });
+          return;
+        }
+
+        const courierName = typeof body.courierName === "string" ? body.courierName.trim() : (existingOrder.courier_name || null);
+        const trackingNumber = typeof body.trackingNumber === "string" ? body.trackingNumber.trim() : (existingOrder.tracking_number || null);
+        const rawTrackingUrl = typeof body.trackingUrl === "string" ? body.trackingUrl.trim() : (existingOrder.tracking_url || null);
+        const trackingUrl = resolveCourierTrackingUrl(rawTrackingUrl, courierName, trackingNumber) || null;
+        const estimatedDeliveryDate = typeof body.estimatedDeliveryDate === "string" ? body.estimatedDeliveryDate.trim() : (existingOrder.estimated_delivery_date || null);
+
+        await query(
+          `UPDATE orders 
+           SET order_status = :orderStatus,
+               courier_name = :courierName,
+               tracking_number = :trackingNumber,
+               tracking_url = :trackingUrl,
+               estimated_delivery_date = :estimatedDeliveryDate
+           WHERE id = :orderId`,
+          {
+            orderId,
+            orderStatus,
+            courierName,
+            trackingNumber,
+            trackingUrl,
+            estimatedDeliveryDate,
+          }
+        );
+
+        let note = null;
+        if (orderStatus === "shipped") {
+          const parts = [];
+          if (courierName) parts.push(`Courier: ${courierName}`);
+          if (trackingNumber) parts.push(`Tracking No: ${trackingNumber}`);
+          if (estimatedDeliveryDate) parts.push(`Est. Delivery: ${estimatedDeliveryDate}`);
+          note = parts.length > 0 ? `Dispatched via ${parts.join(" | ")}` : "Dispatched and out for delivery";
+        }
+
+        if (orderStatus !== existingOrder.order_status || note) {
+          await recordOrderStatusUpdate(existingOrder, orderStatus, note);
         }
 
         sendJson(response, 200, { order: await getOrderDetail(orderId) });
@@ -2269,6 +2898,299 @@ async function handleRequest(request, response) {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/admin/reviews") {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const statusFilter = url.searchParams.get("status");
+      const productIdFilter = url.searchParams.get("productId");
+      const search = url.searchParams.get("search")?.trim().toLowerCase();
+
+      let sql = `
+        SELECT pr.*, p.name AS product_name, p.slug AS product_slug, p.image_url AS product_image, c.slug AS category_slug
+        FROM product_reviews pr
+        JOIN products p ON p.id = pr.product_id
+        JOIN categories c ON c.id = p.category_id
+        WHERE 1=1
+      `;
+      const params = {};
+
+      if (statusFilter && ["pending", "approved", "rejected"].includes(statusFilter)) {
+        sql += " AND pr.status = :status";
+        params.status = statusFilter;
+      }
+      if (productIdFilter) {
+        sql += " AND pr.product_id = :productId";
+        params.productId = productIdFilter;
+      }
+      if (search) {
+        sql += " AND (LOWER(pr.customer_name) LIKE :search OR LOWER(pr.comment) LIKE :search OR LOWER(p.name) LIKE :search)";
+        params.search = `%${search}%`;
+      }
+
+      sql += " ORDER BY pr.created_at DESC";
+
+      const rows = await query(sql, params);
+
+      const [statsRow] = await query(`
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
+          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+          SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+          ROUND(AVG(CASE WHEN status = 'approved' THEN rating ELSE NULL END), 1) AS avg_rating
+        FROM product_reviews
+      `);
+
+      sendJson(response, 200, {
+        reviews: rows.map((r) => ({
+          id: r.id,
+          productId: r.product_id,
+          productName: r.product_name,
+          productSlug: r.product_slug,
+          productImage: r.product_image,
+          categorySlug: r.category_slug,
+          customerName: r.customer_name,
+          customerEmail: r.customer_email,
+          rating: Number(r.rating),
+          title: r.title,
+          comment: r.comment,
+          imageUrl: r.image_url,
+          status: r.status,
+          isVerifiedPurchase: Boolean(r.is_verified_purchase),
+          adminReply: r.admin_reply,
+          adminRepliedAt: r.admin_replied_at,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+        })),
+        stats: {
+          total: Number(statsRow?.total || 0),
+          approved: Number(statsRow?.approved || 0),
+          pending: Number(statsRow?.pending || 0),
+          rejected: Number(statsRow?.rejected || 0),
+          averageRating: statsRow?.avg_rating != null ? Number(statsRow.avg_rating) : 0,
+        },
+      });
+      return;
+    }
+
+    if (method === "PUT" && url.pathname.match(/^\/api\/admin\/reviews\/\d+\/status$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const body = await readBody(request);
+      const status = body.status;
+
+      if (!["approved", "pending", "rejected"].includes(status)) {
+        sendJson(response, 400, { error: "Invalid review status. Must be approved, pending, or rejected." });
+        return;
+      }
+
+      await query("UPDATE product_reviews SET status = :status WHERE id = :id", { status, id });
+      const [review] = await query("SELECT * FROM product_reviews WHERE id = :id", { id });
+
+      if (!review) {
+        sendJson(response, 404, { error: "Review not found." });
+        return;
+      }
+
+      sendJson(response, 200, { review, message: `Review status changed to ${status}.` });
+      return;
+    }
+
+    if (method === "PUT" && url.pathname.match(/^\/api\/admin\/reviews\/\d+\/reply$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const body = await readBody(request);
+      const reply = String(body.reply || "").trim();
+
+      await query(
+        "UPDATE product_reviews SET admin_reply = :reply, admin_replied_at = CURRENT_TIMESTAMP WHERE id = :id",
+        { reply: reply || null, id }
+      );
+      const [review] = await query("SELECT * FROM product_reviews WHERE id = :id", { id });
+
+      if (!review) {
+        sendJson(response, 404, { error: "Review not found." });
+        return;
+      }
+
+      sendJson(response, 200, { review, message: "Admin reply saved." });
+      return;
+    }
+
+    if (method === "DELETE" && url.pathname.match(/^\/api\/admin\/reviews\/\d+$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const [existing] = await query("SELECT id FROM product_reviews WHERE id = :id", { id });
+      if (!existing) {
+        sendJson(response, 404, { error: "Review not found." });
+        return;
+      }
+
+      await query("DELETE FROM product_reviews WHERE id = :id", { id });
+      sendJson(response, 200, { success: true, message: "Review deleted successfully." });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/admin/offers") {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const rows = await query("SELECT * FROM offers ORDER BY sort_order ASC, id DESC");
+      sendJson(response, 200, { offers: rows.map(mapOfferRow) });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/admin/offers") {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const body = await readBody(request);
+      const label = String(body.label || "").trim();
+      const title = String(body.title || "").trim();
+      const description = String(body.description || body.copy || "").trim();
+      const linkUrl = String(body.linkUrl || "").trim();
+      const badgeText = String(body.badgeText || "").trim();
+      const sortOrder = Number.isFinite(Number(body.sortOrder)) ? Number(body.sortOrder) : 0;
+      const isActive = body.isActive !== false ? 1 : 0;
+
+      if (!title) {
+        sendJson(response, 400, { error: "Offer title is required." });
+        return;
+      }
+      if (!description) {
+        sendJson(response, 400, { error: "Offer description is required." });
+        return;
+      }
+
+      const result = await query(
+        `INSERT INTO offers (label, title, description, link_url, badge_text, sort_order, is_active)
+         VALUES (:label, :title, :description, :linkUrl, :badgeText, :sortOrder, :isActive)`,
+        {
+          label: label || "Special Offer",
+          title,
+          description,
+          linkUrl: linkUrl || null,
+          badgeText: badgeText || null,
+          sortOrder,
+          isActive,
+        }
+      );
+
+      const [created] = await query("SELECT * FROM offers WHERE id = :id", { id: result.insertId });
+      sendJson(response, 201, { offer: mapOfferRow(created), message: "Offer created successfully." });
+      return;
+    }
+
+    if (method === "PUT" && url.pathname.match(/^\/api\/admin\/offers\/\d+$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const body = await readBody(request);
+      const label = String(body.label || "").trim();
+      const title = String(body.title || "").trim();
+      const description = String(body.description || body.copy || "").trim();
+      const linkUrl = String(body.linkUrl || "").trim();
+      const badgeText = String(body.badgeText || "").trim();
+      const sortOrder = Number.isFinite(Number(body.sortOrder)) ? Number(body.sortOrder) : 0;
+      const isActive = body.isActive !== false ? 1 : 0;
+
+      if (!title) {
+        sendJson(response, 400, { error: "Offer title is required." });
+        return;
+      }
+      if (!description) {
+        sendJson(response, 400, { error: "Offer description is required." });
+        return;
+      }
+
+      await query(
+        `UPDATE offers
+         SET label = :label, title = :title, description = :description, link_url = :linkUrl,
+             badge_text = :badgeText, sort_order = :sortOrder, is_active = :isActive
+         WHERE id = :id`,
+        {
+          label: label || "Special Offer",
+          title,
+          description,
+          linkUrl: linkUrl || null,
+          badgeText: badgeText || null,
+          sortOrder,
+          isActive,
+          id,
+        }
+      );
+
+      const [updated] = await query("SELECT * FROM offers WHERE id = :id", { id });
+      if (!updated) {
+        sendJson(response, 404, { error: "Offer not found." });
+        return;
+      }
+
+      sendJson(response, 200, { offer: mapOfferRow(updated), message: "Offer updated successfully." });
+      return;
+    }
+
+    if (method === "PATCH" && url.pathname.match(/^\/api\/admin\/offers\/\d+\/status$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const body = await readBody(request);
+      const isActive = body.isActive ? 1 : 0;
+
+      await query("UPDATE offers SET is_active = :isActive WHERE id = :id", { isActive, id });
+      const [updated] = await query("SELECT * FROM offers WHERE id = :id", { id });
+      if (!updated) {
+        sendJson(response, 404, { error: "Offer not found." });
+        return;
+      }
+
+      sendJson(response, 200, { offer: mapOfferRow(updated), message: `Offer ${isActive ? "activated" : "hidden"}.` });
+      return;
+    }
+
+    if (method === "DELETE" && url.pathname.match(/^\/api\/admin\/offers\/\d+$/)) {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const id = url.pathname.split("/")[4];
+      const [existing] = await query("SELECT id FROM offers WHERE id = :id", { id });
+      if (!existing) {
+        sendJson(response, 404, { error: "Offer not found." });
+        return;
+      }
+
+      await query("DELETE FROM offers WHERE id = :id", { id });
+      sendJson(response, 200, { success: true, message: "Offer deleted successfully." });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/admin/whatsapp-bot/status") {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      const botStatus = getWhatsAppBotStatus();
+      sendJson(response, 200, botStatus);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/admin/whatsapp-bot/disconnect") {
+      const admin = await requireAdmin(request, response);
+      if (!admin) return;
+
+      await disconnectWhatsAppBot();
+      sendJson(response, 200, { success: true, message: "WhatsApp Bot disconnected successfully." });
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/api/payments/payhere/notify") {
       const body = await readFormBody(request);
 
@@ -2362,7 +3284,7 @@ async function handleRequest(request, response) {
       const subtotal = resolvedItems.reduce((sum, item) => sum + item.lineTotal, 0);
       const discount = resolvedItems.reduce((sum, item) => sum + item.discountAmount, 0);
       const total = subtotal - discount + deliveryFee;
-      const orderNumber = generateOrderNumber();
+      const orderNumber = await generateOrderNumber();
 
       const orderResult = await query(
         `INSERT INTO orders (
@@ -2507,6 +3429,48 @@ async function handleRequest(request, response) {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/orders/track") {
+      const orderNumber = url.searchParams.get("orderNumber")?.trim();
+      const phoneOrEmail = url.searchParams.get("phoneOrEmail")?.trim();
+
+      if (!orderNumber || !phoneOrEmail) {
+        sendJson(response, 400, { error: "Please provide both Order Number and Phone Number or Email." });
+        return;
+      }
+
+      const rawOrderNumber = String(orderNumber).trim();
+      const strippedOrderNumber = rawOrderNumber.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+      const digitsOnly = rawOrderNumber.replace(/\D/g, "");
+
+      const [orderRow] = await query(
+        `SELECT id FROM orders 
+         WHERE (
+           LOWER(order_number) = LOWER(:rawOrderNumber)
+           OR LOWER(REPLACE(order_number, '-', '')) = :strippedOrderNumber
+           OR (:digitsOnly != '' AND (
+             order_number = CONCAT('GN-', LPAD(:digitsOnly, 4, '0'))
+             OR order_number = CONCAT('GN', LPAD(:digitsOnly, 4, '0'))
+           ))
+         )
+         AND (
+           LOWER(customer_email) = LOWER(:phoneOrEmail)
+           OR customer_phone = :phoneOrEmail
+           OR REPLACE(REPLACE(REPLACE(customer_phone, ' ', ''), '-', ''), '+94', '0') = REPLACE(REPLACE(REPLACE(:phoneOrEmail, ' ', ''), '-', ''), '+94', '0')
+         )
+         LIMIT 1`,
+        { rawOrderNumber, strippedOrderNumber, digitsOnly, phoneOrEmail }
+      );
+
+      if (!orderRow) {
+        sendJson(response, 404, { error: "No matching order found. Please check your order number and contact information." });
+        return;
+      }
+
+      const order = await getOrderDetail(orderRow.id);
+      sendJson(response, 200, { order });
+      return;
+    }
+
     sendJson(response, 404, { error: "Route not found." });
   } catch (error) {
     sendJson(response, 500, { error: error.message || "Server error." });
@@ -2515,12 +3479,17 @@ async function handleRequest(request, response) {
 
 Promise.all([
   ensureOrderNotificationTables(),
+  ensureProductReviewTables(),
+  ensureOfferTables(),
   ensureScheduledDiscountColumns(),
   ensureCosmeticProductColumns(),
   ensureUserVerificationColumns(),
+  ensureOrderDeliveryTrackingColumns(),
 ])
   .then(async () => {
     await clearExpiredDiscounts();
+    await autoDeliverDueOrders();
+
     const discountCleanupTimer = setInterval(() => {
       clearExpiredDiscounts().catch((error) => {
         console.error("Could not clear expired discounts.", error);
@@ -2528,8 +3497,18 @@ Promise.all([
     }, 60_000);
     discountCleanupTimer.unref?.();
 
+    const autoDeliverTimer = setInterval(() => {
+      autoDeliverDueOrders().catch((error) => {
+        console.error("Could not auto-deliver due orders.", error);
+      });
+    }, 60_000);
+    autoDeliverTimer.unref?.();
+
     createServer(handleRequest).listen(PORT, "127.0.0.1", () => {
       console.log(`GlowNest backend running on http://127.0.0.1:${PORT}`);
+      initWhatsAppBot().catch((err) => {
+        console.error("[WhatsApp Bot] Startup notice:", err.message);
+      });
     });
   })
   .catch((error) => {

@@ -212,7 +212,11 @@ CREATE TABLE IF NOT EXISTS orders (
   total_lkr DECIMAL(10, 2) NOT NULL DEFAULT 0,
   payment_method ENUM('cash_on_delivery', 'koko_pay', 'bank_transfer', 'card') NOT NULL DEFAULT 'cash_on_delivery',
   payment_status ENUM('pending', 'paid', 'failed', 'refunded') NOT NULL DEFAULT 'pending',
-  order_status ENUM('new', 'confirmed', 'packed', 'delivered', 'cancelled') NOT NULL DEFAULT 'new',
+  order_status ENUM('new', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled') NOT NULL DEFAULT 'new',
+  courier_name VARCHAR(100) NULL,
+  tracking_number VARCHAR(100) NULL,
+  tracking_url VARCHAR(255) NULL,
+  estimated_delivery_date VARCHAR(60) NULL,
   notes TEXT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -343,6 +347,37 @@ CREATE TABLE IF NOT EXISTS customer_addresses (
     ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS product_reviews (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  product_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NULL,
+  customer_name VARCHAR(120) NOT NULL,
+  customer_email VARCHAR(160) NULL,
+  rating TINYINT UNSIGNED NOT NULL,
+  title VARCHAR(180) NULL,
+  comment TEXT NOT NULL,
+  image_url VARCHAR(255) NULL,
+  status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+  is_verified_purchase BOOLEAN NOT NULL DEFAULT FALSE,
+  admin_reply TEXT NULL,
+  admin_replied_at TIMESTAMP NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY product_reviews_product_id_index (product_id),
+  KEY product_reviews_user_id_index (user_id),
+  KEY product_reviews_status_index (status),
+  KEY product_reviews_rating_index (rating),
+  CONSTRAINT product_reviews_product_id_foreign
+    FOREIGN KEY (product_id) REFERENCES products(id)
+    ON UPDATE CASCADE
+    ON DELETE CASCADE,
+  CONSTRAINT product_reviews_user_id_foreign
+    FOREIGN KEY (user_id) REFERENCES users(id)
+    ON UPDATE CASCADE
+    ON DELETE SET NULL
+);
+
 INSERT INTO categories (name, slug, description, sort_order)
 VALUES
   ('Perfumes', 'perfumes', 'Long-lasting scents for daily wear, gifts, and special moments.', 1),
@@ -352,3 +387,19 @@ ON DUPLICATE KEY UPDATE
   name = VALUES(name),
   description = VALUES(description),
   sort_order = VALUES(sort_order);
+
+CREATE TABLE IF NOT EXISTS offers (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  label VARCHAR(80) NOT NULL,
+  title VARCHAR(180) NOT NULL,
+  description TEXT NOT NULL,
+  link_url VARCHAR(255) NULL,
+  badge_text VARCHAR(80) NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY offers_is_active_index (is_active),
+  KEY offers_sort_order_index (sort_order)
+);

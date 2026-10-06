@@ -8,8 +8,21 @@ function getTransporter() {
     return null;
   }
 
-  const port = Number(process.env.SMTP_PORT || 465);
-  const secure = process.env.SMTP_SECURE !== "false" && port === 465;
+  if (user.includes("gmail.com")) {
+    return nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user,
+        pass,
+      },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 12000,
+    });
+  }
+
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = process.env.SMTP_SECURE === "true" || port === 465;
 
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST || "smtp.gmail.com",
@@ -19,6 +32,9 @@ function getTransporter() {
       user,
       pass,
     },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 12000,
   });
 }
 
